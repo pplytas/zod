@@ -66,6 +66,12 @@ const apiLibraries: ZodResource[] = [
       "Use a single Zod schema as the source of truth for a GraphQL query, its inferred response type, and runtime validation.",
     slug: "mattiasahlsen/zodql",
   },
+  {
+    name: "Good Webhooks",
+    url: "https://github.com/pplytas/good-webhooks",
+    description: "Outbound webhooks stored in PostgreSQL, with event payloads validated by Zod schemas.",
+    slug: "pplytas/good-webhooks",
+  },
   // https://github.com/honojs/middleware/tree/main/packages/zod-validator
   // {
   //   name: "@hono/zod-validator",
