@@ -167,6 +167,54 @@ test("an upper size bound fails before any element is parsed", () => {
   ).toEqual([1, 2]);
 });
 
+test("an upper size bound after a refinement, or on encode, fails before any element is parsed", () => {
+  let parsed = 0;
+  const el = z.string().refine(() => ++parsed);
+  let refined = 0;
+  const tooBig = [{ code: "too_big", path: [] }];
+  expect(
+    z
+      .array(el)
+      .refine(() => ++refined)
+      .min(1)
+      .max(2)
+      .safeParse(["a", "b", "c"]).error!.issues
+  ).toMatchObject(tooBig);
+  expect(z.safeEncode(z.array(el).max(2), ["a", "b", "c"]).error!.issues).toMatchObject(tooBig);
+  expect(z.safeEncode(z.set(el).max(1), new Set(["a", "b"])).error!.issues).toMatchObject(tooBig);
+  expect(
+    z.safeEncode(
+      z.object({ a: z.array(el).max(2) }).refine(() => ++refined),
+      { a: ["a", "b", "c"] }
+    ).error!.issues
+  ).toMatchObject([{ code: "too_big", path: ["a"] }]);
+  expect([parsed, refined]).toEqual([0, 0]);
+  expect(z.encode(z.array(el).max(2), ["a", "b"])).toEqual(["a", "b"]);
+
+  // a check function may replace the value, so it ends the gate
+  const shrink = (ctx: { value: number[] }) => {
+    ctx.value = ctx.value.slice(0, 2);
+  };
+  expect(z.array(z.number()).check(shrink).max(2).parse([1, 2, 3])).toEqual([1, 2]);
+  expect(
+    z
+      .array(z.number())
+      .superRefine((_, ctx) => shrink(ctx))
+      .max(2)
+      .parse([1, 2, 3])
+  ).toEqual([1, 2]);
+});
+
+test("forwarding more issues than fit in a call's arguments does not throw", async () => {
+  // past ~125k, spreading a child's issues into push() overflowed the stack
+  const bad = Array(200_000).fill(0);
+  const inner = z.array(z.string());
+  expect(z.array(inner).safeParse([bad]).error!.issues).toHaveLength(200_000);
+  expect(z.record(z.string(), inner).safeParse({ a: bad }).error!.issues[199_999].path).toEqual(["a", 199_999]);
+  expect(z.set(inner).safeParse(new Set([bad])).error!.issues).toHaveLength(200_000);
+  expect((await z.object({ a: inner }).safeParseAsync({ a: bad })).error!.issues).toHaveLength(200_000);
+});
+
 test("parse should fail given sparse array", () => {
   const schema = z.array(z.string()).nonempty().min(1).max(3);
   const result = schema.safeParse(new Array(3));

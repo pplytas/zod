@@ -11,13 +11,15 @@ export class $ZodCyclicError extends Error {
 
 interface Entry {
   value: unknown;
-  /** `null` until the node's children are parsed. */
-  issues: errors.$ZodRawIssue[] | null;
+  /** `null` until the node's children are parsed, then what `record` returns. */
+  issues: unknown[] | null;
 }
 
 interface State {
   /** Weak throughout because `attach` caches a bucket on the schema instance, which outlives the parse. */
   buckets: WeakMap<$ZodType, WeakMap<object, Entry>>;
+  /** The same for a pass with checks skipped, whose results a checked pass must never reuse. */
+  unchecked: WeakMap<$ZodType, WeakMap<object, Entry>> | undefined;
   /** Nodes a back-edge resolved to before they finished. */
   backEdges: WeakSet<object> | undefined;
 }
@@ -26,16 +28,30 @@ interface State {
 const STATE = "~memo";
 type WithState = { [STATE]?: State };
 
-const NO_ISSUES: errors.$ZodRawIssue[] = [];
+const NO_ISSUES: unknown[] = [];
 
 // a value a cycle can close through
 function isRef(value: unknown): value is object {
   return value !== null && typeof value === "object";
 }
 
-// Receivers prefix paths in place, so the cache and every hand-out need their own copies.
-function cloneIssues(issues: errors.$ZodRawIssue[]): errors.$ZodRawIssue[] {
-  return issues.map((iss) => (iss.path ? { ...iss, path: iss.path.slice() } : { ...iss }));
+// the issues from `start` on (an encode runs a node's own checks first), each by reference beside its path length since receivers only prepend, or copied while pathless
+function record(issues: errors.$ZodRawIssue[], start: number): unknown[] {
+  if (issues.length <= start) return NO_ISSUES;
+  const out: unknown[] = [];
+  for (let i = start; i < issues.length; i++) {
+    const iss = issues[i]!;
+    out.push(iss.path ? iss : { ...iss }, iss.path?.length);
+  }
+  return out;
+}
+
+// a fresh copy per hand-out, its path cut back to the recorded length
+function replay(rec: unknown[], into: errors.$ZodRawIssue[]): void {
+  for (let i = 0; i < rec.length; i += 2) {
+    const iss = rec[i] as errors.$ZodRawIssue;
+    into.push(iss.path ? { ...iss, path: iss.path.slice(iss.path.length - (rec[i + 1] as number)) } : { ...iss });
+  }
 }
 
 const recursive: WeakMap<object, boolean> = /*@__PURE__*/ new WeakMap();
@@ -197,11 +213,17 @@ export function isRecursiveSchema(inst: $ZodType): boolean {
   return isRecursive(inst, new Set(), true) !== NONE;
 }
 
-function bucketFor(state: State, inst: $ZodType): WeakMap<object, Entry> {
-  let bucket = state.buckets.get(inst);
+function bucketFor(state: State, inst: $ZodType, ctx: ParseContextInternal): WeakMap<object, Entry> {
+  let buckets = state.buckets;
+  // an encode's check-free first pass shares the state through its spread context, so it keeps buckets of its own
+  if (ctx.skipChecks) {
+    state.unchecked ??= new WeakMap();
+    buckets = state.unchecked;
+  }
+  let bucket = buckets.get(inst);
   if (!bucket) {
     bucket = new WeakMap();
-    state.buckets.set(inst, bucket);
+    buckets.set(inst, bucket);
   }
   return bucket;
 }
@@ -268,7 +290,7 @@ const memo: $ZodMemoizer = {
 
         let state = (ctx as WithState)[STATE];
         if (!state) {
-          state = { buckets: new WeakMap(), backEdges: undefined };
+          state = { buckets: new WeakMap(), unchecked: undefined, backEdges: undefined };
           (ctx as WithState)[STATE] = state;
         }
 
@@ -276,7 +298,7 @@ const memo: $ZodMemoizer = {
         if (lastCtx === ctx) {
           bucket = lastBucket!;
         } else {
-          bucket = bucketFor(state, inst);
+          bucket = bucketFor(state, inst, ctx);
           lastCtx = ctx;
           lastBucket = bucket;
         }
@@ -285,7 +307,7 @@ const memo: $ZodMemoizer = {
         if (hit) {
           payload.value = hit.value;
           if (hit.issues) {
-            if (hit.issues.length) payload.issues.push(...cloneIssues(hit.issues));
+            replay(hit.issues, payload.issues);
           } else {
             // Still being parsed: its own checks cover it, so skip them here.
             payload.memo = true;
@@ -297,6 +319,7 @@ const memo: $ZodMemoizer = {
 
         handoff = bucket;
         const depth = open.length;
+        const start = payload.issues.length;
         const result = base(payload, ctx);
         handoff = undefined;
         // A container that rejected its input outright allocated nothing.
@@ -305,11 +328,11 @@ const memo: $ZodMemoizer = {
         // Both paths written out so the sync one allocates no closure. It runs once per node, and capturing here cost more than everything else combined.
         if (result instanceof Promise) {
           return result.then((r) => {
-            if (entry) entry.issues = r.issues.length ? cloneIssues(r.issues) : NO_ISSUES;
+            if (entry) entry.issues = record(r.issues, start);
             return r;
           });
         }
-        if (entry) entry.issues = result.issues.length ? cloneIssues(result.issues) : NO_ISSUES;
+        if (entry) entry.issues = record(result.issues, start);
         return result;
       };
 

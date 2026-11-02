@@ -930,18 +930,29 @@ export function prefixIssues(path: PropertyKey, issues: errors.$ZodRawIssue[]): 
   });
 }
 
+/** Prefixes each issue's path with `path` in place and appends it to `target`. */
+export function pushPrefixed(target: errors.$ZodRawIssue[], path: PropertyKey, issues: errors.$ZodRawIssue[]): void {
+  // a loop, since spreading a long list into push() overflows the stack
+  for (const iss of issues) {
+    (iss as any).path ??= [];
+    (iss as any).path.unshift(path);
+    target.push(iss);
+  }
+}
+
 export function unwrapMessage(message: string | { message: string } | undefined | null): string | undefined {
   return typeof message === "string" ? message : message?.message;
 }
 
 /* A check holds no link back to the schema it is attached to — the same check instance is shared by every clone of that schema — so the owner is stamped onto the issues a check just raised, at the only point where both are in scope. Runs on the failure path only; `start` is the issue count from before the check ran. */
-/** The leading size checks of `defChecks` that set an upper bound, each paired with it. */
+/** The size checks of `defChecks` that set an upper bound ahead of any check that may rewrite the value, each paired with it. */
 export function sizeCaps(defChecks: checks.$ZodCheck<never>[] | undefined): [number, checks.$ZodCheck<never>][] {
   const caps: [number, checks.$ZodCheck<never>][] = [];
   for (const ch of defChecks ?? []) {
     const d = ch._zod.def as any;
-    // a later check may rewrite the value
-    if (!/_(length|size)$|_equals$/.test(d.check)) break;
+    // an overwrite, or a check function without a predicate, may replace the value a later bound reads
+    if (d.check === "overwrite" || (d.check === "custom" && !d.fn)) break;
+    if (!/_(length|size)$|_equals$/.test(d.check)) continue;
     const max = d.maximum ?? d.length ?? d.size;
     if (max >= 0) caps.push([max, ch]);
   }
@@ -950,7 +961,10 @@ export function sizeCaps(defChecks: checks.$ZodCheck<never>[] | undefined): [num
 
 export function attachSchema(issues: errors.$ZodRawIssue[], start: number, inst: schemas.$ZodType): void {
   for (let i = start; i < issues.length; i++) {
-    (issues[i] as any).schema ??= inst;
+    const iss = issues[i] as any;
+    iss.schema ??= inst;
+    // a check may push a path it reuses across parses, and receivers prefix it in place
+    if (iss.path) iss.path = iss.path.slice();
   }
 }
 
@@ -1058,7 +1072,8 @@ export function issue(...args: [string | errors.$ZodRawIssue, any?, any?]): erro
     };
   }
 
-  return { ...iss };
+  // a fresh path, since receivers prefix it in place and the caller may reuse the array
+  return iss.path ? { ...iss, path: [...iss.path] } : { ...iss };
 }
 
 export function cleanEnum(obj: Record<string, EnumValue>): EnumValue[] {

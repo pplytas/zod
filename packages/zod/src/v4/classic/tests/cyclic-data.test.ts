@@ -309,6 +309,38 @@ test("encodes through a cycle", () => {
   expect(result.self).toBe(result);
 });
 
+test("an encode checks every node below a checked recursive container, as a decode does", async () => {
+  const Node: any = z
+    .object({
+      n: z.number().max(5),
+      get kids() {
+        return z.array(Node);
+      },
+    })
+    .refine((v: any) => v.n !== 3, "three");
+  const paths = (r: any) => r.error?.issues.map((iss: z.core.$ZodIssue) => iss.path);
+
+  const nested = { n: 1, kids: [{ n: 10, kids: [] }] };
+  expect(paths(z.safeEncode(Node, nested))).toEqual([["kids", 0, "n"]]);
+  expect(paths(z.safeDecode(Node, nested))).toEqual([["kids", 0, "n"]]);
+
+  const cyclic: any = { n: 1, kids: [] };
+  cyclic.kids.push({ n: 10, kids: [cyclic] });
+  expect(paths(z.safeEncode(Node, cyclic))).toEqual([["kids", 0, "n"]]);
+
+  // an encode runs a node's own check before parsing it, so the second visit must not repeat the first one's
+  const shared = { n: 3, kids: [{ n: 10, kids: [] }] };
+  const twice = { n: 1, kids: [shared, shared] };
+  const expected = [
+    ["kids", 0],
+    ["kids", 0, "kids", 0, "n"],
+    ["kids", 1],
+    ["kids", 1, "kids", 0, "n"],
+  ];
+  expect(paths(z.safeEncode(Node, twice))).toEqual(expected);
+  expect(paths(await z.safeEncodeAsync(Node, twice))).toEqual(expected);
+});
+
 test("keeps separate parses independent", () => {
   const Node: any = z.object({
     id: z.number(),
@@ -982,4 +1014,110 @@ test("a finished parse pins nothing on the schema", async () => {
   }
 
   expect(ref.deref()).toBeUndefined();
+});
+
+test("a repeat visit reports the first visit's issues at its own path", async () => {
+  const Node: any = z.object({
+    v: z.number(),
+    get kids() {
+      return z.array(Node);
+    },
+  });
+  const leaf = { v: "y", kids: [] };
+  const shared = { v: "x", kids: [leaf, leaf] };
+  const cyclic: any = { v: "z", kids: [] };
+  cyclic.kids.push(cyclic);
+  const input = { v: 0, kids: [shared, shared, cyclic, cyclic] };
+
+  const paths = [
+    ["kids", 0, "v"],
+    ["kids", 0, "kids", 0, "v"],
+    ["kids", 0, "kids", 1, "v"],
+    ["kids", 1, "v"],
+    ["kids", 1, "kids", 0, "v"],
+    ["kids", 1, "kids", 1, "v"],
+    ["kids", 2, "v"],
+    ["kids", 3, "v"],
+  ];
+  for (const r of [Node.safeParse(input), Node.safeParse(input, { jitless: true }), await Node.safeParseAsync(input)]) {
+    expect(r.error!.issues.map((iss: z.core.$ZodIssue) => iss.path)).toEqual(paths);
+  }
+});
+
+test("union options that re-run one child report its issues as the first run did", () => {
+  const U: any = z.union([
+    z.object({
+      kind: z.literal("a"),
+      x: z.string().refine((s) => s.length > 1, "short"),
+      get child() {
+        return U.optional();
+      },
+    }),
+    z.object({
+      kind: z.literal("b"),
+      y: z.number(),
+      get child() {
+        return U.optional();
+      },
+    }),
+  ]);
+  // only the second option matches, so the child's issues it forwards are the repeat ones
+  expect(U.safeParse({ kind: "b", y: 1, child: { kind: "a", x: "z" } }).error!.issues).toEqual([
+    { code: "custom", path: ["child", "x"], message: "short" },
+  ]);
+
+  const [{ errors }] = U.safeParse({ kind: "a", x: "q", child: { kind: "b", y: "no" } }).error!.issues as any;
+  expect(errors[1].at(-1)).toEqual(errors[0].at(-1));
+  expect(errors[0].at(-1).errors.map((o: any) => o.map((iss: any) => iss.path))).toEqual([[["kind"], ["x"]], [["y"]]]);
+
+  // an issue with no path yet stays without one, though the first visit's copy has gained one since
+  const X: any = z.strictObject({
+    get self() {
+      return X.optional();
+    },
+  });
+  const seen: unknown[] = [];
+  const w = { extra: 1 };
+  const r = z.object({ a: X, b: z.union([X, X.readonly()]) }).safeParse(
+    { a: w, b: w },
+    {
+      error: (iss) => {
+        if (iss.code === "unrecognized_keys") seen.push(iss.path);
+        return undefined;
+      },
+    }
+  );
+  expect(r.error!.issues.map((iss) => iss.path)).toEqual([["a"], ["b"]]);
+  expect(seen).toEqual([undefined, undefined, ["a"]]);
+});
+
+test("a deep failure holds memory in proportion to its issues, not its depth", () => {
+  v8.setFlagsFromString("--expose-gc");
+  const gc = vm.runInNewContext("gc") as () => void;
+  const used = () => v8.getHeapStatistics().used_heap_size;
+
+  const T: any = z.lazy(() => z.object({ next: T.optional(), vals: z.array(z.number()).optional() }));
+  let base = 0;
+  let held = 0;
+  // runs while every node's cached result is still reachable
+  const Probe = T.refine(
+    () => {
+      gc();
+      held = used() - base;
+      return true;
+    },
+    { when: () => true }
+  );
+  const measure = (depth: number) => {
+    let input: any = { vals: Array(1000).fill("x") };
+    for (let i = 0; i < depth; i++) input = { next: input };
+    gc();
+    base = used();
+    expect(Probe.safeParse(input).success).toBe(false);
+    return held;
+  };
+
+  // the error grows linearly with depth here, so a cache copying it per level grows quadratically
+  const small = measure(25);
+  expect(measure(200) / small).toBeLessThan(16);
 });

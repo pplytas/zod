@@ -1852,7 +1852,8 @@ function capSize(inst: $ZodType, size: (input: any) => number): void {
   const parse = inst._zod.parse;
   inst._zod.parse = (payload, ctx) => {
     const n = size(payload.value);
-    if (n > cap && !ctx?.skipChecks && ctx?.direction !== "backward") {
+    // an encode runs checks between a check-free first pass and the real one, so the first pass is where elements are spared
+    if (n > cap && (ctx?.direction === "backward") === !!ctx?.skipChecks) {
       for (const [max, ch] of util.sizeCaps(inst._zod.def.checks)) {
         if (n > max && ch._zod.def.when!(payload)) {
           const start = payload.issues.length;
@@ -1874,7 +1875,7 @@ const setSize = (input: unknown): number => (input instanceof Set ? input.size :
 
 function handleArrayResult(result: ParsePayload<any>, final: ParsePayload<any[]>, index: number) {
   if (result.issues.length) {
-    final.issues.push(...util.prefixIssues(index, result.issues));
+    util.pushPrefixed(final.issues, index, result.issues);
   }
   final.value[index] = result.value;
 }
@@ -2018,7 +2019,7 @@ function handlePropertyResult(
     if (optin !== undefined && isOptionalOut && !isPresent) {
       return;
     }
-    final.issues.push(...util.prefixIssues(key, result.issues));
+    util.pushPrefixed(final.issues, key, result.issues);
   }
 
   if (!isPresent && optin === undefined) {
@@ -2292,7 +2293,8 @@ export const $ZodObjectJIT: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$
           let ${id}_ab = false;
           for (let i = 0; i < ${id}.issues.length; i++) {
             const iss = ${id}.issues[i];
-            iss.path = iss.path ? [${k}, ...iss.path] : [${k}];
+            if (iss.path) iss.path.unshift(${k});
+            else iss.path = [${k}];
             payload.issues.push(iss);
             if (iss.continue !== true) ${id}_ab = true;
           }
@@ -2870,13 +2872,11 @@ export function mergeValues(
     return { valid: true, data: a };
   }
   if (util.isPlainObject(a) && util.isPlainObject(b)) {
-    const bKeys = Object.keys(b);
-    const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
-
     const newObj: any = { ...a, ...b };
     if (Object.prototype.hasOwnProperty.call(newObj, "__proto__")) delete newObj.__proto__;
-    for (const key of sharedKeys) {
-      if (key === "__proto__") continue;
+    for (const key of Object.keys(a)) {
+      // own and enumerable is exactly membership in `Object.keys(b)`, without a scan per key
+      if (key === "__proto__" || !Object.prototype.propertyIsEnumerable.call(b, key)) continue;
       const sharedValue = mergeValues(a[key], b[key]);
       if (!sharedValue.valid) {
         return {
@@ -2918,7 +2918,7 @@ export function mergeValues(
 
 function handleIntersectionResults(result: ParsePayload, left: ParsePayload, right: ParsePayload): ParsePayload {
   // Track which side(s) reject each key. A key rejection is reported only when BOTH sides reject it, so a key owned by one branch survives the other's key schema. strictObject reports these as unrecognized_keys; a record with an open key schema reports one invalid_key per key.
-  const unrecKeys = new Map<string, { l?: true; r?: true }>();
+  const unrecKeys = new Map<string, { l?: true; r?: true; u?: true }>();
   let unrecIssue: errors.$ZodRawIssue | undefined;
   const keyIssues = new Map<string, errors.$ZodRawIssue>();
 
@@ -2935,8 +2935,14 @@ function handleIntersectionResults(result: ParsePayload, left: ParsePayload, rig
       return false;
     }
     for (const k of keys) {
-      if (!unrecKeys.has(k)) unrecKeys.set(k, {});
-      unrecKeys.get(k)![side] = true;
+      let flags = unrecKeys.get(k);
+      if (!flags) {
+        flags = {};
+        unrecKeys.set(k, flags);
+      }
+      flags[side] = true;
+      // `u` marks the keys the reported unrecognized_keys issue lists
+      if (iss === unrecIssue) flags.u = true;
     }
     return true;
   };
@@ -2950,14 +2956,15 @@ function handleIntersectionResults(result: ParsePayload, left: ParsePayload, rig
   }
 
   // Report only keys rejected by BOTH sides
-  const bothKeys = [...unrecKeys].filter(([, f]) => f.l && f.r).map(([k]) => k);
-  if (bothKeys.length) {
-    const aggregated = unrecIssue ? bothKeys.filter((k) => (unrecIssue!.keys as string[]).includes(k)) : [];
-    if (aggregated.length) result.issues.push({ ...unrecIssue!, keys: aggregated });
-    for (const k of bothKeys) {
-      if (!aggregated.includes(k) && keyIssues.has(k)) result.issues.push(keyIssues.get(k)!);
-    }
+  const aggregated: string[] = [];
+  const rejected: errors.$ZodRawIssue[] = [];
+  for (const [k, f] of unrecKeys) {
+    if (!f.l || !f.r) continue;
+    if (f.u) aggregated.push(k);
+    else if (keyIssues.has(k)) rejected.push(keyIssues.get(k)!);
   }
+  if (aggregated.length) result.issues.push({ ...unrecIssue!, keys: aggregated });
+  for (const iss of rejected) result.issues.push(iss);
 
   const merged = mergeValues(left.value, right.value);
 
@@ -3106,16 +3113,14 @@ export const $ZodTuple: core.$constructor<$ZodTuple> = /*@__PURE__*/ core.$const
 
     // sound because rest is non-empty exactly when every fixed index is present, the one case handleTupleResults cannot discard an item's issues
     if (def.rest && !itemAborted) {
-      let i = items.length - 1;
-      const rest = input.slice(items.length);
       let seen = payload.issues.length;
-      for (const el of rest) {
+      // the loop's own `let i` gives each async element its own index
+      for (let i = items.length; i < input.length; i++) {
         if (abortEarly && payload.issues.length !== seen) {
           if (util.aborted(payload, seen)) break;
           seen = payload.issues.length;
         }
-        i++;
-        const result = def.rest._zod.run({ value: el, issues: [] }, ctx);
+        const result = def.rest._zod.run({ value: input[i], issues: [] }, ctx);
         if (result instanceof Promise) {
           proms.push(result.then((r) => handleTupleResult(r, payload, i)));
         } else {
@@ -3142,7 +3147,7 @@ function getTupleOptStart(items: readonly $ZodType[], key: "optin" | "optout") {
 
 function handleTupleResult(result: ParsePayload, final: ParsePayload<any[]>, index: number) {
   if (result.issues.length) {
-    final.issues.push(...util.prefixIssues(index, result.issues));
+    util.pushPrefixed(final.issues, index, result.issues);
   }
   final.value[index] = result.value;
 }
@@ -3168,7 +3173,7 @@ function handleTupleResults(
         final.value.length = i;
         break;
       }
-      final.issues.push(...util.prefixIssues(i, r.issues));
+      util.pushPrefixed(final.issues, i, r.issues);
     }
     final.value[i] = r.value;
   }
@@ -3321,14 +3326,14 @@ export const $ZodRecord: core.$constructor<$ZodRecord> = /*@__PURE__*/ core.$con
             proms.push(
               result.then((result) => {
                 if (result.issues.length) {
-                  payload.issues.push(...util.prefixIssues(key, result.issues));
+                  util.pushPrefixed(payload.issues, key, result.issues);
                 }
                 payload.value[outKey] = result.value;
               })
             );
           } else {
             if (result.issues.length) {
-              payload.issues.push(...util.prefixIssues(key, result.issues));
+              util.pushPrefixed(payload.issues, key, result.issues);
             }
             payload.value[outKey] = result.value;
           }
@@ -3413,14 +3418,14 @@ export const $ZodRecord: core.$constructor<$ZodRecord> = /*@__PURE__*/ core.$con
           proms.push(
             result.then((result) => {
               if (result.issues.length) {
-                payload.issues.push(...util.prefixIssues(key, result.issues));
+                util.pushPrefixed(payload.issues, key, result.issues);
               }
               payload.value[outKey] = result.value;
             })
           );
         } else {
           if (result.issues.length) {
-            payload.issues.push(...util.prefixIssues(key, result.issues));
+            util.pushPrefixed(payload.issues, key, result.issues);
           }
           payload.value[outKey] = result.value;
         }
@@ -3529,7 +3534,7 @@ function handleMapResult(
 ): void {
   if (keyResult.issues.length) {
     if (util.propertyKeyTypes.has(typeof key)) {
-      final.issues.push(...util.prefixIssues(key as PropertyKey, keyResult.issues));
+      util.pushPrefixed(final.issues, key as PropertyKey, keyResult.issues);
     } else {
       final.issues.push({
         code: "invalid_key",
@@ -3543,7 +3548,7 @@ function handleMapResult(
   }
   if (valueResult.issues.length) {
     if (util.propertyKeyTypes.has(typeof key)) {
-      final.issues.push(...util.prefixIssues(key as PropertyKey, valueResult.issues));
+      util.pushPrefixed(final.issues, key as PropertyKey, valueResult.issues);
     } else {
       final.issues.push({
         origin: "map",
@@ -3623,7 +3628,7 @@ export const $ZodSet: core.$constructor<$ZodSet> = /*@__PURE__*/ core.$construct
 
 function handleSetResult(result: ParsePayload, final: ParsePayload<Set<any>>) {
   if (result.issues.length) {
-    final.issues.push(...result.issues);
+    for (const iss of result.issues) final.issues.push(iss);
   }
   final.value.add(result.value);
 }
@@ -4678,6 +4683,8 @@ export interface $ZodTemplateLiteralDef extends $ZodTypeDef {
 export interface $ZodTemplateLiteralInternals<Template extends string = string>
   extends $ZodTypeInternals<Template, Template> {
   pattern: RegExp;
+  /** @internal `pattern` rewritten to match the same strings without polynomial backtracking. */
+  matcher: RegExp;
   def: $ZodTemplateLiteralDef;
   isst: errors.$ZodIssueInvalidType;
 }
@@ -4780,26 +4787,62 @@ function partPattern(schema: $ZodType): string | undefined {
   return leafPattern(schema);
 }
 
+const catchAll = /^\[\\s\\S\](?:\*|\{(\d+),\})$/;
+const loneBackslash = /(?:^|[^\\])(?:\\\\)*\\$/;
+
+// the public source, plus a parse-time one where a catch-all followed by a literal and another catch-all stops at the literal's first occurrence, since the next catch-all absorbs any later split
+function templateSources(parts: $ZodTemplateLiteralPart[]): [string, string] {
+  const regexParts: string[] = [];
+  let fast = "";
+  // escaped literal text after the pending catch-all, whose minimum length is `min` (-1 when none is pending)
+  let lit = "";
+  let min = -1;
+  const flush = () => {
+    if (min >= 0) fast += `[\\s\\S]{${min},}${lit}`;
+    min = -1;
+    lit = "";
+  };
+  for (const part of parts) {
+    let src: string;
+    // undefined for a literal, null for any other non-catch-all part
+    let any: RegExpExecArray | null | undefined;
+    if (typeof part === "object" && part !== null) {
+      // is Zod schema
+      const source = partPattern(part);
+      if (!source) {
+        throw new Error(`Invalid template literal part, no pattern found: ${[...(part as any)._zod.traits].shift()}`);
+      }
+      src = util.cleanRegex(source);
+      any = catchAll.exec(src);
+      // a lone trailing backslash would escape the catch-all's first character
+      if (any && loneBackslash.test(regexParts[regexParts.length - 1]!)) any = null;
+    } else if (part === null || util.primitiveTypes.has(typeof part)) {
+      src = util.escapeRegex(`${part}`);
+    } else {
+      throw new Error(`Invalid template literal part: ${part}`);
+    }
+    if (any) {
+      if (lit) fast += `[\\s\\S]{${min}}(?:(?!${lit})[\\s\\S])*${lit}`;
+      min = (lit || min < 0 ? 0 : min) + (+any[1]! || 0);
+      lit = "";
+    } else if (any === undefined && min >= 0) lit += src;
+    else {
+      flush();
+      fast += src;
+    }
+    regexParts.push(src);
+  }
+  flush();
+  return [regexParts.join(""), fast];
+}
+
 export const $ZodTemplateLiteral: core.$constructor<$ZodTemplateLiteral> = /*@__PURE__*/ core.$constructor(
   "$ZodTemplateLiteral",
   (inst, def) => {
     $ZodType.init(inst, def);
-    const regexParts: string[] = [];
-    for (const part of def.parts) {
-      if (typeof part === "object" && part !== null) {
-        // is Zod schema
-        const source = partPattern(part);
-        if (!source) {
-          throw new Error(`Invalid template literal part, no pattern found: ${[...(part as any)._zod.traits].shift()}`);
-        }
-        regexParts.push(util.cleanRegex(source));
-      } else if (part === null || util.primitiveTypes.has(typeof part)) {
-        regexParts.push(util.escapeRegex(`${part}`));
-      } else {
-        throw new Error(`Invalid template literal part: ${part}`);
-      }
-    }
-    inst._zod.pattern = new RegExp(`^${regexParts.join("")}$`);
+    const [source, fast] = templateSources(def.parts);
+    inst._zod.pattern = new RegExp(`^${source}$`);
+    inst._zod.matcher = fast === source ? inst._zod.pattern : new RegExp(`^${fast}$`);
 
     inst._zod.parse = (payload, _ctx) => {
       if (typeof payload.value !== "string") {
@@ -4812,9 +4855,7 @@ export const $ZodTemplateLiteral: core.$constructor<$ZodTemplateLiteral> = /*@__
         return payload;
       }
 
-      inst._zod.pattern.lastIndex = 0;
-
-      if (!inst._zod.pattern.test(payload.value)) {
+      if (!inst._zod.matcher.test(payload.value)) {
         payload.issues.push({
           input: payload.value,
           inst,

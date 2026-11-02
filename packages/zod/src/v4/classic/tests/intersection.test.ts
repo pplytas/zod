@@ -249,6 +249,40 @@ test("a record's key schema governs only its own keys inside an intersection", (
   expect(z.record(z.string().regex(/^S_/), z.string()).safeParse({ S_a: "s", bad: "x" }).success).toBe(false);
 });
 
+test("key reconciliation does not scan a key list per key", () => {
+  const input: Record<string, number> = { a: 1, b: 2 };
+  for (let i = 0; i < 2000; i++) input[`k${i}`] = i;
+  const record = z.record(z.string(), z.number());
+  const records = z.intersection(record, record);
+  const stricts = z.intersection(z.strictObject({ a: z.number() }), z.strictObject({ b: z.number() }));
+  const mixed = z.intersection(z.strictObject({ a: z.number() }), z.record(z.string().regex(/^S_/), z.number()));
+
+  // counts the elements every indexOf/includes call walks; matching each key against a list of every key walked ~n² of them
+  let walked = 0;
+  const { indexOf, includes } = Array.prototype;
+  Array.prototype.indexOf = function (this: unknown[], ...args: [unknown, number?]) {
+    walked += this.length;
+    return indexOf.apply(this, args);
+  };
+  Array.prototype.includes = function (this: unknown[], ...args: [unknown, number?]) {
+    walked += this.length;
+    return includes.apply(this, args);
+  };
+  let results: unknown[];
+  try {
+    results = [records.safeParse(input), stricts.safeParse(input), mixed.safeParse(input)];
+  } finally {
+    Array.prototype.indexOf = indexOf;
+    Array.prototype.includes = includes;
+  }
+  expect(walked).toBeLessThan(20_000);
+  expect(results).toMatchObject([
+    { success: true, data: input },
+    { error: { issues: [{ code: "unrecognized_keys", keys: { length: 2000 } }] } },
+    { error: { issues: [{ code: "unrecognized_keys", keys: { length: 2001 } }] } },
+  ]);
+});
+
 test("partialRecord reports an out-of-set key as unrecognized, not invalid", () => {
   const enumKeys = z.partialRecord(z.enum(["a", "b"]), z.string()).safeParse({ a: "x", zzz: "q" });
   expect(enumKeys.success).toBe(false);
